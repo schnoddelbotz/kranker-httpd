@@ -1,0 +1,518 @@
+/*
+ * KRANKER httpd
+ * a somewhat sick :-) httpd.
+ * on startup, KRANKER slurps the whole document root into
+ * memory. while doing so, KRANKER creates a GET hash lookup
+ * table and precompiles HTTP repsonse headers.
+ * Once started, KRANKER will produce zero disk I/O (except
+ * docroot doesnt fit into memory and swapping takes place).
+ * KRANKER can be for you:
+ * - if you have as dobule as mouch memory as the total
+ *   size of your website (try 'du -sk $homepage_dir')
+ * - if you only use static content - no CGI.
+ * TODO:
+ * - sane memory / docrootsize check
+ * - make lynx happy (+content type!)
+ * - ...
+ * - logging: unformatted (binlog) to udp loghost
+ * hash.c is a copy of
+ * http://burtleburtle.net/bob/c/lookup3.c
+ * the webserver is founded on
+ * http://cygwin.com/ml/cygwin/2001-04/msg01830/uhttpd.c
+ * 
+*/
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <errno.h>
+#include <ctype.h>
+#include <time.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <signal.h>
+#include <sys/socket.h> /* for socket(), bind(), and connect() */
+#include <arpa/inet.h>  /* for sockaddr_in and inet_ntoa() */
+#include <netinet/in.h>
+#include <netdb.h>
+#include <fcntl.h>
+
+int read_docroot(char *docdir);
+int add_document(char* root, char* filename, char* dirname, char* filebasename, struct stat s);
+int scan_docs(char* root, char* dir);
+int valid_content(char* filename);
+int CreateTCPServerSocket(unsigned short port);
+void DieWithError(char *errorMessage);  /* Error handling function */
+void HandleSignal(int sig, siginfo_t *si, void *context);
+
+
+//int read_docroot(char* docdir);
+char *baseurl="/";
+#define MAXFILES 32768
+#define MAXTHREADS 8
+#define MAXPENDING 5    /* Maximum outstanding connection requests */
+int  doccount = 0;
+int  verbose = 0;
+int  runasdaemon  = 0;
+int  srvport = 8080;
+int  maxrequests = 99999999;
+char* kversion = "0.0.1a";
+size_t  docrootbytes, sentbytes; // FIXME add with each file, spit out when going online...
+char *docs[MAXFILES];
+struct docinfo { uint32_t hash; int docid; char* url; int filesize; char* header; int headersize; };
+struct docinfo docinfo[MAXFILES];
+int hashtab[MAXFILES];
+long int conno = 0;
+
+/* microhttpd */
+int MySock;			/* Socket */
+int NewSock;			/* Socket for accept. */
+int peer_size = 0;		/* Name stack size for the peer */
+struct sockaddr_in addr;	/* Our address */
+///*struct*/ socklen_t peer;	/* The peer's address */
+struct sockaddr_in peer;	/* The peer's address */
+struct hostent *hostentry;	/* Hostentry - for anything we need */
+char *request;			/* Our HTTP request */
+char *BufIn; //, *BufOut;		/* Input/Output-Buffer */
+int BufInLen = 2048, BufOutLen = 2048;
+struct arx {
+  short port;
+  char *basedir;
+} args;
+
+
+void DieWithError(char *errorMessage) {
+	printf("%s\n", errorMessage);
+	exit(1);
+}
+
+int getdoc_id(uint32_t needle) {
+	int i;
+	for (i=0; i<doccount; i++) {
+		if (docinfo[i].hash == needle) {
+			return i;
+		}
+	}
+	return 404;
+}
+
+int http_request(int Socket, char *req) {
+	int docid;
+	char *req_method;
+	char *req_get;
+	char *getline;
+	uint32_t cHash;
+	req_get = strtok(req, "\r");
+	if (req_get == NULL)
+		return -1;
+
+	if (strlen(req_get) > 100 || strlen(req_get)<1) { 
+		if (verbose) printf("Bad request.\n");
+		 return 0; // BAD request...
+	 }
+	//strcpy(getline, req_get);
+
+	int kill = 0;
+	//printf("req len: %d\n", strlen(req_get));
+	cHash  = hashlittle(req_get, strlen(req_get), 128);
+
+	//req_method = strtok(req, " "); ### NO - DO !  hash only!
+	//if (hashtab[cHash]) { docid = hashtab[cHash]; printf("New lookup...... %d\n", docid); }
+	//printf("HTTP Method  : '%s'\n", req_method);
+	docid = getdoc_id(cHash);
+	if (docid==404) {
+		printf("404 %s\n", req_get);
+		char* msg = "HTTP/1.0 404 Not Found\n\nNot found.";
+		send(Socket, msg, strlen(msg), 0);
+		return -1;
+	}
+
+	if (verbose) {
+		printf("200 %s\n", req_get);
+	}
+	if (verbose >1 ) {
+		printf("HTTP hash    : %x\n", cHash);
+		printf("HTTP docid   : %d\n", docid);
+		printf("HTTP r size  : %d\n", docinfo[docid].headersize);
+		printf("HTTP b size  : %d\n", docinfo[docid].filesize);
+		printf("HTTP response: \n%s\n", docinfo[docid].header);
+	}
+
+	sentbytes =+ docinfo[docid].headersize + docinfo[docid].filesize;
+
+	/* guess that if this was one send(), life would be nicer */
+	if (send(Socket, docinfo[docid].header, docinfo[docid].headersize, 0) < docinfo[docid].headersize) {
+		printf("Error while sending %i response body bytes in line %i!\n",
+			 docinfo[docid].headersize, __LINE__ - 1);
+		return -1;
+	}
+	if (send(Socket, docs[docid], docinfo[docid].filesize, 0) < docinfo[docid].filesize) {
+		printf("Error while sending %i response header bytes in line %i!\n",
+			 docinfo[docid].filesize, __LINE__ - 1);
+		return -1;
+	}
+	return 0;
+}
+
+void clear(char *set, size_t len) {
+  char *sptr;
+
+  realloc(set, len + 1);
+
+  sptr = set;
+
+  for (sptr = set; sptr < set + len; sptr++) {
+    *sptr = '\0';
+  }
+  return;
+}
+
+int main(int argc,char **argv) {
+	int c;
+	int docid=0;
+	int do_chroot=0;
+	char *docrootdir=NULL;
+	// microhttpd
+	int argp = 1;
+	//BufOut = malloc(2048);
+	struct sigaction sVal;
+
+	sVal.sa_flags     = SA_SIGINFO;	// 3-var signal-handler
+	sVal.sa_sigaction = HandleSignal;	// define sighandler function
+	sigaction(SIGINT,  &sVal, NULL);
+	sigaction(SIGTERM, &sVal, NULL);
+	//sigaction(SIGPIPE, &sVal, NULL);
+
+	BufIn = malloc(2048);
+	//BufIn = malloc(8192);
+	args.basedir = malloc(124);
+	strcpy(args.basedir, "/usr/local/httpd");
+
+
+        while ((c = getopt(argc, argv, "b:cd:i:p:r:x:vD")) != -1)
+                switch (c) {
+                        case 'r': maxrequests = atoi(optarg);   break;  
+                        case 'c': do_chroot = 1;       		break;  
+                        case 'd': docrootdir = optarg;       	break;  
+                        case 'i': docid = atoi(optarg);       	break;  
+                        case 'v': verbose++;       		break;  
+                        case 'D': runasdaemon++;       		break;  
+                        case 'p': srvport = atoi(optarg);       break;  // docroot relative dir
+                        //case 'p': port = optarg;       break;  // http port
+                        //case 'x': exitrequests = optarg;       break;  // die after # of requests
+		}
+
+        argc -= optind;
+        argv += optind;
+	if (verbose) printf(" * KRANKER 0.0.1 starting up...\n\n");
+
+
+	if (!docrootdir) {
+		printf("  Usage: kranker [-v..] [-p port] -d DOCROOT\n");
+		exit(1);
+	}
+
+	/* open socket */
+	MySock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (MySock == (~0)) {
+		printf("%s: Error creating server socket.\nErrno was: %i\n", __FILE__, errno);
+		exit(1);
+	}
+
+
+	// micro setup
+	args.port = srvport;
+	args.basedir = docrootdir;
+
+	////// microhttpd ///////////////////////////////////////////
+	printf("Setting up server socket: ");
+	addr.sin_family = AF_INET;
+	printf("AF_INET");
+	addr.sin_port = htons(args.port);
+	printf(", Port=%i", args.port);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	printf(", any IP.\n");
+
+	if (bind(MySock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		printf("%s: Error when using bind.\n", __FILE__);
+		if (errno == EADDRNOTAVAIL) {
+			printf("Address not available.\n");
+		} else if (errno == EADDRINUSE) {
+			printf("Some other socket is already using the address.\n");
+		} else if (errno == EINVAL) {
+			printf("The socket already has an address.\n");
+		} else if (errno == EACCES) {
+			printf("Access to socket denied. (Maybe choose a port > 1024?)\n");
+		} else if (errno == EBADF) {
+			printf("Bad file descriptor. (???)\n");
+		} else {
+			printf("Unknown error (errno = %i)\n", errno);
+		}
+		exit(1);
+	}
+
+	printf("\n\t === Server socket started up and bound to port %i ===\n\n", args.port);
+
+	printf("Listening for connections.\n");
+	if (listen(MySock, 10) < 0) {
+		printf("%s: Listening error. Errno is %i.\n", __FILE__, errno);
+		exit(1);
+	}
+
+	/* pump document root into memory ... FIXME tooo late here? */
+	read_docroot(docrootdir);
+
+	peer_size = sizeof(peer);
+
+	if (do_chroot==1) {
+		if (chroot(args.basedir) < 0) {
+			printf("chroot() failed!\n");
+			exit(1);
+		}
+	}
+
+	BufIn = malloc(1025);
+
+	while (conno<maxrequests && (NewSock = accept(MySock, (struct sockaddr *)&peer, &peer_size)) != -1) {
+		conno++;
+		char host_addr[16];
+
+		clear(BufIn, BufInLen);
+		//clear(BufOut, BufOutLen);
+
+		strcpy(host_addr, inet_ntoa(peer.sin_addr));
+		if (verbose>2)
+			printf("Connection from %s, port %i.\n", host_addr,
+		     		ntohs(peer.sin_port));
+		errno = 0;
+
+		if (recv(NewSock, BufIn, 1024, 0) < 0) {
+			printf("%s: recv() failed. ", __FILE__);
+			if (errno == EBADF) {
+				printf("Bad file descriptor. (???)\n");
+			} else if (errno == ENOTSOCK) {
+				printf("Not a socket. (???)\n");
+			} else if (errno == EWOULDBLOCK) {
+				printf("Would block nonblocking mode socket.\n");
+			} else if (errno == EINTR) {
+				printf("Interrupted by a signal.\n");
+			} else if (errno == ENOTCONN) {
+				printf("Socket disconnected.\n");
+				close (NewSock); // wget fix+
+				printf("Socket soft shutdown done.\n");
+				continue;
+			} else {
+				printf("Unknown error (errno = %i)\n", errno);
+			}
+			errno = 0;
+		}
+
+		if (BufIn == NULL) {
+			printf("Error: HTTP request was NULL!\n");
+			send(NewSock, "HTTP/1.0 505\n", 1024, 0);
+		} else if (http_request(NewSock, BufIn) < 0) {
+			if (verbose>1)
+				printf("Socket error %i.\n", errno);
+			errno = 0;
+		}
+
+		if (verbose>1)
+			printf("Host disconnected.\n");
+
+		shutdown(NewSock, 2);
+		close (NewSock);
+	}
+	if (NewSock == -1) {
+		printf("Exit from bad accept() run (whatever might have happened).\n");
+	}
+
+	printf("%s: Cleaning up. Closing socket: ", __FILE__);
+	close (MySock);
+	printf("OK.\n");
+
+	printf("Server: exit.\n");
+
+	////// micro http end //////////////////////////////////////////////////////
+
+	if (verbose) printf("\n * KRANKER going down.\n");
+	return 0;
+}
+
+/* read docroot into mem, including the response header */
+/* redo on HUP */
+int read_docroot(char* docdir) {
+	if (verbose) printf("Reading docroot... %s\n", docdir);
+	if (chdir(docdir) != 0) {
+		printf("  Docroot %s unreadable. Bye.\n", docdir);
+		exit(1);
+	}
+	scan_docs(docdir,".");
+	printf("Serving docroot with %d bytes.\n", docrootbytes);
+	return 1;
+}
+
+int scan_docs(char* root, char* dir) {
+	DIR *dirp = NULL;
+	struct dirent *dp;
+	struct stat s;
+	char *fn;
+        if ((fn = malloc(4096)) == NULL)
+                   return 0;
+
+	if (verbose) printf("-- scanning directory: %s\n", dir);
+	dirp = opendir(dir);
+	if (!dirp)
+		return 0;
+	while ((dp = readdir(dirp)) != NULL) {
+		/* if (!has_index && glob(index.*) {add_doc(this) } */
+		//sprintf(fn, "%s/%s", dir,dp->d_name);
+		if (!strcmp(dp->d_name,".") || !strcmp(dp->d_name,"..") || !strcmp(dp->d_name,".svn") ) {
+			continue;
+		}
+		snprintf(fn, 4096, "%s/%s", dir,dp->d_name);
+		if (stat(fn, &s) < 0) {	
+			perror(fn);
+			exit(1);
+		}
+		//printf("%s : %d \n", fn, s.st_size);
+		if (S_ISDIR(s.st_mode)) {
+			scan_docs(root,fn);
+		}
+		if (S_ISREG(s.st_mode) && valid_content(fn)) {
+			add_document(root,fn,dir,dp->d_name,s);
+		}
+	}
+	closedir(dirp);
+	free(fn);
+	return 0;
+}
+
+int add_document(char* root, char* filename, char* dirname, char* filebasename, struct stat s) {
+	FILE  *tf,*docsrc;
+	char buffer[512];
+	char cmd[512];
+	char header[1024];
+	char ft[100]; // filetype
+	char urlpath[255];
+	int size = 0;
+	char *result;
+	char conlen[100] = "Content-Length: 0000000000\n\0";
+	char getstr[100] = "xxxxyyyyyyyyyyyyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";;
+	char tmpdirname[100] = "\0";
+	/*
+	  HTTP/1.1 200 OK
+	  Last-Modified: Thu, 05 Jan 2006 23:09:46 GMT
+	  Accept-Ranges: bytes
+	  Content-Length: 12035
+	  Keep-Alive: timeout=15, max=29
+	  Connection: Keep-Alive
+	  Content-Type: image/jpeg
+	*/
+	/* buggy 
+	snprintf(cmd, 4096, "file -bI %s", filename);
+	tf = popen(cmd,"r");
+	  fgets(ft, sizeof(ft), tf);
+	pclose(tf);
+	*/
+
+	if (verbose>1) printf("Adding id %d : %s : %d \n", doccount, filename, (int)s.st_size /*, ft*/);
+
+	docsrc = fopen(filename,"rb");
+	//docs[doccount] = malloc(s.st_size);
+	fseek(docsrc, 0, SEEK_END);
+	size = ftell(docsrc);
+	fseek(docsrc, 0, SEEK_SET);
+	result = (char *)malloc(size+1);
+	if (size != fread(result, sizeof(char), size, docsrc))
+	{
+		free(result);
+		return -2; // -2 means file reading fail
+	}
+	fclose(docsrc);
+	docs[doccount] = result;
+	//struct docinfo { char* hash; char* url; int docid; };
+	docinfo[doccount].docid = doccount;
+	docinfo[doccount].filesize = size;
+	
+	hashtab[ docinfo[doccount].hash ] = doccount;
+
+	/* build hash */
+	strncpy(tmpdirname, dirname+1, strlen(dirname)-1);
+	snprintf(getstr, sizeof(getstr), "GET %s/%s HTTP/1.0",  tmpdirname, filebasename );
+	docinfo[doccount].hash  = hashlittle(getstr, strlen(getstr), 128);
+	/* build header */
+	docinfo[doccount].header = (char *)malloc(1024); // "HTTP/1.1 200 OK\n";
+	strcpy (docinfo[doccount].header, "HTTP/1.0 200 OK\n");
+	snprintf(conlen, sizeof(conlen), "Content-Length: %d\n", size /*, dirname, filebasename*/ );
+	strcat (docinfo[doccount].header, conlen);
+
+	strcat (docinfo[doccount].header, "Server: KRANKER/0.0.1a\n");
+
+	/* finish http header */
+	strcat (docinfo[doccount].header, "\n");
+	docinfo[doccount].headersize =  strlen(docinfo[doccount].header);
+	if (verbose) printf("Adding id %4d, hash: %x,  %8d bytes : %s\n",
+		 doccount, docinfo[doccount].hash, (int)s.st_size , getstr);
+
+	/* FIXME same again for http/1.1 */
+	doccount++;
+	docs[doccount] = result;
+	docinfo[doccount].docid = doccount-1;
+	docinfo[doccount].filesize = size;
+	snprintf(getstr, sizeof(getstr), "GET %s/%s HTTP/1.1",  tmpdirname, filebasename );
+	docinfo[doccount].hash  = hashlittle(getstr, strlen(getstr), 128);
+	docinfo[doccount].header = (char *)malloc(1024); // "HTTP/1.1 200 OK\n";
+	strcpy (docinfo[doccount].header, "HTTP/1.0 200 OK\n");
+	snprintf(conlen, sizeof(conlen), "Content-Length: %d\n", size /*, dirname, filebasename*/ );
+	strcat (docinfo[doccount].header, conlen);
+	// FIXME CONTENT TYPE
+	/* finish http header */
+	strcat (docinfo[doccount].header, "\n");
+	docinfo[doccount].headersize =  strlen(docinfo[doccount].header);
+	if (verbose) printf("Adding id %4d, hash: %x,  %8d bytes : %s\n",
+		 doccount, docinfo[doccount].hash, (int)s.st_size , getstr);
+
+
+	docrootbytes += size;
+	doccount++;
+	return 0;
+}
+
+int valid_content(char* filename) {
+	//printf("Verifying %s\n", filename);
+	// run file -bI filename
+	return 1;
+}
+
+/* returns pointer to reply */
+char* parse_request() {
+	// hash request. result found? -> reply
+	return "foo";
+}
+
+
+void HandleSignal(int sig, siginfo_t *si, void *context) {
+	switch (sig) {
+		case SIGINT:
+			close (MySock);
+			printf("SIGINT caught, shutting down.\n");
+			printf("%d bytes sent in %d requests.\n", sentbytes, conno);
+			exit(0);
+			break;
+			
+/*
+		case SIGPIPE:
+			printf("SIGPIPE caught. dead client? lost sock? FIXME!\n");
+			close (MySock);
+			exit(0);
+			break;
+*/
+
+		case SIGTERM:
+			exit(0);
+			break;
+	}
+}
+

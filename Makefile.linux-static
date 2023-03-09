@@ -1,0 +1,36 @@
+CFLAGS = -Wall -O2 -I./libarchive-2.4.17/libarchive
+# -g debug
+LDFLAGS = -L./libarchive-2.4.17/.libs
+#CFLAGS = -g
+
+LARCHIVE = libarchive-2.4.17
+
+#kranker: hash.o kranker.o
+kranker: larchive tsrm_virtual_cwd.o xtar.o kranker.o 
+	#$(CC) $(CFLAGS) -o kranker hash.o kranker.o
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -larchive -o kranker kranker.o tsrm_virtual_cwd.o xtar.o ./libarchive-2.4.17/.libs/libarchive.a -lbz2 -lz
+
+larchive:
+	(  cd $(LARCHIVE) ; [ -d .libs ] || ( ./configure && make ) )
+
+hash.o: hash.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+xtar.o: xtar.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+kranker.o: kranker.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+tsrm_virtual_cwd.o: tsrm_virtual_cwd.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# let him serve 3 requests (1 index, 1 image, 1 404)
+test: kranker
+	./kranker -D -r 2000 -d www.test.com 
+	ab -n 1000 http://127.0.0.1:8080/1024b.random
+	ab -n 1000 http://127.0.0.1:8080/1m.random
+	@echo "2000 test requests done. kranker should shut down..."
+
+clean:
+	rm -f kranker kranker.o hash.o xtar.o

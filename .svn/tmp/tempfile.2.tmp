@@ -1,0 +1,19 @@
+CFLAGS = -Wall -g
+#CFLAGS = -O2
+CFLAGS = -O3
+
+kranker: hash.o kranker.o
+	$(CC) $(CFLAGS) -o kranker hash.o kranker.o
+
+hash.o: hash.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+kranker.o: kranker.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# let him serve 3 requests (1 index, 1 image, 1 404)
+test: kranker
+	./kranker -r 3 -v -d www.test.com 
+
+clean:
+	rm kranker kranker.o hash.o
